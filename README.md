@@ -1,10 +1,7 @@
-# ReVanced Magisk Module
-[![Telegram](https://img.shields.io/badge/Telegram-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/rvc_magisk)
-[![CI](https://github.com/j-hc/revanced-magisk-module/actions/workflows/ci.yml/badge.svg?event=schedule)](https://github.com/j-hc/revanced-magisk-module/actions/workflows/ci.yml)
+# Moprhe Magisk Module
+Made by [j-hc]((https://github.com/j-hc/revanced-magisk-module)
 
-Extensive ReVanced builder  
-
-APKMirror Scraper(download_apkmirror.py) from https://github.com/ikafly144/morphe-module
+Extensive Morphe builder
 
 Get the [latest CI release](https://github.com/j-hc/revanced-magisk-module/releases).
 
@@ -56,4 +53,13 @@ bash <(curl -sSf https://raw.githubusercontent.com/j-hc/revanced-magisk-module/m
 $ git clone https://github.com/j-hc/revanced-magisk-module --depth 1
 $ cd revanced-magisk-module
 $ ./build.sh
-```
+``
+
+
+## 📜 Credits
+
+  - [MorpheApp/morphe-patches](https://github.com/MorpheApp/morphe-patches)
+  - [MorpheApp/morphe-desktop](https://github.com/MorpheApp/morphe-desktop)
+  - [j-hc/revanced-magisk-module](https://github.com/j-hc/revanced-magisk-module)
+  - Claude and Gemini (This is vibe coded)
+  - [download_apkmirror.py](https://github.com/ikafly144/morphe-module/blob/main/download_apkmirror.py)
