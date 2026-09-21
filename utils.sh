@@ -47,7 +47,10 @@ wpr() {
 }
 
 _clean_tmp() {
-	rm -rf ./${TEMP_DIR}/*tmp.* ./${TEMP_DIR}/*tmp_* ./${TEMP_DIR}/*/*tmp.* ./${TEMP_DIR}/*-temporary-files ./*-temporary-files
+	find ./${TEMP_DIR} -maxdepth 1 ! -name "bcprov.jar" -name "*tmp.*" -exec rm -rf {} + 2>/dev/null || :
+	find ./${TEMP_DIR} -maxdepth 1 ! -name "bcprov.jar" -name "*tmp_*" -exec rm -rf {} + 2>/dev/null || :
+	find ./${TEMP_DIR} -maxdepth 1 ! -name "bcprov.jar" -name "*-temporary-files" -exec rm -rf {} + 2>/dev/null || :
+	rm -rf ./*-temporary-files
 }
 
 abort() {
@@ -279,7 +282,6 @@ semver_validate() {
 }
 get_patch_last_supported_ver() {
 	local list_patches=$1 pkg_name=$2 inc_sel=$3 is_experimental=$4
-	# _exc_sel=$4 _exclusive=$5
 	local op
 	if [ "$inc_sel" ]; then
 		if ! op=$(awk '{$1=$1}1' <<<"$list_patches"); then
@@ -312,7 +314,6 @@ patches_list_versions() {
 	local cli_jar=$1 patches_jar=$2 pkg_name=$3 is_experimental=$4
 	local cmd_base="java -jar '$cli_jar' list-versions"
 
-	# TODO: remove this later
 	local cli_name
 	cli_name=$(basename "$cli_jar")
 	if [ "${cli_name::8}" = "revanced" ]; then
@@ -371,9 +372,16 @@ merge_splits() {
 		epr "APKEditor error: $OP"
 		return 1
 	fi
-		# sign the merged stock apk
-	if ! OP=$(java -jar "$APKSIGNER" sign --ks morphe.keystore --ks-pass pass:Morphe_Xky --key-pass pass:Morphe_Xky --ks-key-alias Morphe_Xky \
-		--out "${output}" "${output}-unsigned"); then
+
+	# sign the merged stock apk using BKS provider
+	local bks_provider_opts=""
+	if [ -f "$TEMP_DIR/bcprov.jar" ]; then
+		bks_provider_opts="--provider-class org.bouncycastle.jce.provider.BouncyCastleProvider --provider-arg $TEMP_DIR/bcprov.jar"
+	fi
+
+	if ! OP=$(java -jar "$APKSIGNER" sign --ks morphe.keystore --ks-type BKS $bks_provider_opts \
+		--ks-pass pass: --key-pass pass: --ks-key-alias Morphe_Xky \
+		--out "${output}" "${output}-unsigned" 2>&1); then
 		epr "apksigner error: $OP"
 		return 1
 	fi
@@ -542,15 +550,26 @@ patch_apk() {
 	local tmp_files
 	tmp_files="$(pwd)/$(mktemp -d -p "$TEMP_DIR")"
 
-	local cmd="java -jar '$cli_jar' patch '$stock_input' -o '$patched_apk' -p '$patches_jar' --keystore=morphe.keystore \
---keystore-entry-password=Morphe_Xky --keystore-password="" --signer=Morphe_Xky --keystore-entry-alias=Morphe_Xky -t '$tmp_files' $patcher_args"
+	local bks_opts=""
+	if [ -f "$TEMP_DIR/bcprov.jar" ]; then
+		bks_opts="-cp $TEMP_DIR/bcprov.jar:$cli_jar"
+	fi
 
-	# TODO: remove this later
+	# For BKS keystores, if the keystore has an empty storepass, pass empty strings.
+	# Adjust --signer / --keystore-entry-alias to match your alias in the BKS keystore.
+	local cmd
+	if [ -n "$bks_opts" ]; then
+		cmd="java $bks_opts com.morphe.desktop.Main patch '$stock_input' -o '$patched_apk' -p '$patches_jar' --keystore=morphe.keystore \
+--keystore-entry-password=\"\" --keystore-password=\"\" --signer=Morphe_Xky --keystore-entry-alias=Morphe_Xky -t '$tmp_files' $patcher_args"
+	else
+		cmd="java -jar '$cli_jar' patch '$stock_input' -o '$patched_apk' -p '$patches_jar' --keystore=morphe.keystore \
+--keystore-entry-password=\"\" --keystore-password=\"\" --signer=Morphe_Xky --keystore-entry-alias=Morphe_Xky -t '$tmp_files' $patcher_args"
+	fi
+
 	local cli_name
 	cli_name=$(basename "$cli_jar")
 	if [ "${cli_name::8}" = revanced ]; then cmd+=" -b"; fi
 
-	# if [ "$OS" = Android ]; then cmd+=" --custom-aapt2-binary='${AAPT2}'"; fi
 	pr "$cmd"
 	if eval "$cmd"; then [ -f "$patched_apk" ]; else
 		rm "$patched_apk" 2>/dev/null || :
