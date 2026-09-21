@@ -1,5 +1,5 @@
 # Moprhe Magisk Module
-Made by [j-hc]((https://github.com/j-hc/revanced-magisk-module)
+Made by [j-hc](https://github.com/j-hc/revanced-magisk-module)
 
 Extensive Morphe builder
 
