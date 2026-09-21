@@ -54,7 +54,7 @@ $ git clone https://github.com/j-hc/revanced-magisk-module --depth 1
 $ cd revanced-magisk-module
 $ ./build.sh
 ``
-
+---
 
 ## 📜 Credits
 
