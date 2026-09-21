@@ -35,8 +35,19 @@ jobs:
           python3 -m pip install --upgrade pip
           pip3 install cloudscraper beautifulsoup4
 
-      - name: Download BouncyCastle provider
-        run: curl -L -o temp/bcprov.jar --create-dirs https://repo1.maven.org/maven2/org/bouncycastle/bcprov-jdk18on/1.78/bcprov-jdk18on-1.78.jar
+      - name: Setup BouncyCastle Provider for Java 21
+        run: |
+          mkdir -p temp
+          curl -L -o temp/bcprov.jar https://repo1.maven.org/maven2/org/bouncycastle/bcprov-jdk18on/1.78/bcprov-jdk18on-1.78.jar
+          # Register BouncyCastle into the active Java runtime security configuration
+          JAVA_SEC_FILE="$JAVA_HOME/conf/security/java.security"
+          if [ -f "$JAVA_SEC_FILE" ]; then
+            # Find the next security provider index
+            NEXT_INDEX=$(grep "^security.provider." "$JAVA_SEC_FILE" | wc -l | awk '{print $1 + 1}')
+            echo "security.provider.${NEXT_INDEX}=org.bouncycastle.jce.provider.BouncyCastleProvider" | sudo tee -a "$JAVA_SEC_FILE"
+          fi
+          # Copy to Java ext/jmods or make available system-wide
+          sudo cp temp/bcprov.jar "$JAVA_HOME/lib/" || :
 
       - name: Update config
         if: ${{ inputs.from_ci }}
@@ -62,6 +73,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NEXT_VER_CODE: ${{ steps.next_ver_code.outputs.NEXT_VER_CODE }}
+          CLASSPATH: "${{ github.workspace }}/temp/bcprov.jar"
 
       - name: Get output
         id: get_output
@@ -173,4 +185,4 @@ jobs:
           echo "'$MSG'"
           MSG=${MSG:0:9450}
           POST="https://api.telegram.org/bot${TG_TOKEN}/sendMessage"
-          curl -X POST --data-urlencode "parse_mode=Markdown" --data-urlencode "disable_web_page_preview=true" --data-urlencode "text=${MSG}" --data-urlencode "chat_id=${TG_CHAT}" "$POST"
+          curl -X POST --data-urlencode "parse_mode=Markdown" --data-urlencode "disable_web_page_preview=true" --data-urlencode "text=${MSG}" --data-urlencode "chat_id=${TG_CHAT}" "$POST"  
