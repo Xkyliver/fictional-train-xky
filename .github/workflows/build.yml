@@ -14,21 +14,29 @@ jobs:
     permissions: write-all
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/setup-java@v5
+        with:
+          distribution: "zulu"
+          java-version: "21"
+
       - name: Checkout
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
           submodules: true
 
-      - uses: actions/setup-java@v5
-        with:
-          distribution: "zulu"
-          java-version: "21"
-
-      - uses: actions/setup-python@v7
+      - name: Set up Python
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-      - run: pip install -r requirements.txt
+
+      - name: Install scraper requirements
+        run: |
+          python3 -m pip install --upgrade pip
+          pip3 install cloudscraper beautifulsoup4
+
+      - name: Download BouncyCastle provider
+        run: curl -L -o temp/bcprov.jar --create-dirs https://repo1.maven.org/maven2/org/bouncycastle/bcprov-jdk18on/1.78/bcprov-jdk18on-1.78.jar
 
       - name: Update config
         if: ${{ inputs.from_ci }}
@@ -64,17 +72,25 @@ jobs:
           echo "${DELIM}" >> "$GITHUB_OUTPUT"
           cp -f build.md build.tmp
 
+      - name: Get patches version for title
+        id: patches_ver
+        run: |
+          PV=$(grep -m1 '^Patches: ' build.md | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          if [ -z "$PV" ]; then PV="$TAG"; fi
+          echo "VER=$PV" >> "$GITHUB_OUTPUT"
+
       - name: Upload release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.next_ver_code.outputs.NEXT_VER_CODE }}
           BODY: ${{ steps.get_output.outputs.BUILD_LOG }}
+          VER: ${{ steps.patches_ver.outputs.VER }}
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release edit "$TAG" --title "Release" --notes "$BODY"
+            gh release edit "$TAG" --title "$VER" --notes "$BODY"
             gh release upload "$TAG" ./build/* --clobber
           else
-            gh release create "$TAG" ./build/* --title "Release" --notes "$BODY"
+            gh release create "$TAG" ./build/* --title "$VER" --notes "$BODY"
           fi
 
       - name: Update modules changelog and update json
@@ -139,19 +155,20 @@ jobs:
               MODULES+="${NL}📦[${OUTPUT}](${DL_URL})"
             fi
           done
-          if [ -n "$MODULES" ]; then
-            MODULES="Modules:${NL}${MODULES#"$NL"}"
-            if [ -n "$APKS" ]; then MODULES+=${NL}${NL}; fi
-          fi
-          if [ -n "$APKS" ]; then APKS="APKs:${NL}${APKS#"$NL"}"; fi
+          MODULES=${MODULES#"$NL"}
+          APKS=${APKS#"$NL"}
 
-          BODY="$(cat ../build.md)"
+          BODY="$(sed 's/^\* \*\*/↪ \*\*/g; s/^\* `/↪ \*\*/g; s/`/\*/g; s/^\* /\↪/g; s/\*\*/\*/g; s/###//g; s/^- /↪ /g; /^==/d;' ../build.md)"
           MSG="*New build!*
 
           ${BODY}
 
           *▼ Download Links:*
-          ${MODULES}${APKS}
+          Modules:
+          ${MODULES}
+
+          APKs:
+          ${APKS}
           "
           echo "'$MSG'"
           MSG=${MSG:0:9450}
