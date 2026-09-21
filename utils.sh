@@ -60,11 +60,14 @@ abort() {
 	kill -9 -- -$$ 2>/dev/null
 	exit 1
 }
+
 java() {
+	local bc_cp=""
+	if [ -f "$TEMP_DIR/bcprov.jar" ]; then bc_cp="$TEMP_DIR/bcprov.jar"; fi
 	if [ "${JAVA_HOME_21_X64-}" ]; then
-		env -i JAVA_HOME="$JAVA_HOME_21_X64" "$JAVA_HOME_21_X64"/bin/java --enable-native-access=ALL-UNNAMED "$@"
+		env CLASSPATH="$bc_cp" JAVA_HOME="$JAVA_HOME_21_X64" "$JAVA_HOME_21_X64"/bin/java --enable-native-access=ALL-UNNAMED "$@"
 	else
-		env -i java --enable-native-access=ALL-UNNAMED "$@"
+		env CLASSPATH="$bc_cp" java --enable-native-access=ALL-UNNAMED "$@"
 	fi
 }
 
@@ -373,13 +376,15 @@ merge_splits() {
 		return 1
 	fi
 
-	# sign the merged stock apk using BKS provider
-	local bks_provider_opts=""
+	# Run ApkSignerTool directly with bcprov.jar and apksigner.jar on classpath
+	local cp_signer="${BIN_DIR}/apksigner.jar"
 	if [ -f "$TEMP_DIR/bcprov.jar" ]; then
-		bks_provider_opts="--provider-class org.bouncycastle.jce.provider.BouncyCastleProvider --provider-arg $TEMP_DIR/bcprov.jar"
+		cp_signer="${TEMP_DIR}/bcprov.jar:${BIN_DIR}/apksigner.jar"
 	fi
 
-	if ! OP=$(java -jar "$APKSIGNER" sign --ks morphe.keystore --ks-type BKS $bks_provider_opts \
+	if ! OP=$(java -cp "$cp_signer" com.android.apksigner.ApkSignerTool sign \
+		--ks morphe.keystore --ks-type BKS \
+		--provider-class org.bouncycastle.jce.provider.BouncyCastleProvider \
 		--ks-pass pass: --key-pass pass: --ks-key-alias Morphe_Xky \
 		--out "${output}" "${output}-unsigned" 2>&1); then
 		epr "apksigner error: $OP"
@@ -550,21 +555,13 @@ patch_apk() {
 	local tmp_files
 	tmp_files="$(pwd)/$(mktemp -d -p "$TEMP_DIR")"
 
-	local bks_opts=""
+	local bks_cp="$cli_jar"
 	if [ -f "$TEMP_DIR/bcprov.jar" ]; then
-		bks_opts="-cp $TEMP_DIR/bcprov.jar:$cli_jar"
+		bks_cp="$TEMP_DIR/bcprov.jar:$cli_jar"
 	fi
 
-	# For BKS keystores, if the keystore has an empty storepass, pass empty strings.
-	# Adjust --signer / --keystore-entry-alias to match your alias in the BKS keystore.
-	local cmd
-	if [ -n "$bks_opts" ]; then
-		cmd="java $bks_opts com.morphe.desktop.Main patch '$stock_input' -o '$patched_apk' -p '$patches_jar' --keystore=morphe.keystore \
+	local cmd="java -cp '$bks_cp' -jar '$cli_jar' patch '$stock_input' -o '$patched_apk' -p '$patches_jar' --keystore=morphe.keystore \
 --keystore-entry-password=\"\" --keystore-password=\"\" --signer=Morphe_Xky --keystore-entry-alias=Morphe_Xky -t '$tmp_files' $patcher_args"
-	else
-		cmd="java -jar '$cli_jar' patch '$stock_input' -o '$patched_apk' -p '$patches_jar' --keystore=morphe.keystore \
---keystore-entry-password=\"\" --keystore-password=\"\" --signer=Morphe_Xky --keystore-entry-alias=Morphe_Xky -t '$tmp_files' $patcher_args"
-	fi
 
 	local cli_name
 	cli_name=$(basename "$cli_jar")
