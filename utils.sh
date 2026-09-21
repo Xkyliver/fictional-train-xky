@@ -385,7 +385,7 @@ merge_splits() {
 	if ! OP=$(java -cp "$cp_signer" com.android.apksigner.ApkSignerTool sign \
 		--ks morphe.keystore --ks-type BKS \
 		--provider-class org.bouncycastle.jce.provider.BouncyCastleProvider \
-		--ks-pass pass: --key-pass pass: --ks-key-alias Morphe_Xky \
+		--ks-pass pass:changeit --key-pass pass:changeit --ks-key-alias Morphe_Xky \
 		--out "${output}" "${output}-unsigned" 2>&1); then
 		epr "apksigner error: $OP"
 		return 1
@@ -561,7 +561,7 @@ patch_apk() {
 	fi
 
 	local cmd="java -cp '$bks_cp' -jar '$cli_jar' patch '$stock_input' -o '$patched_apk' -p '$patches_jar' --keystore=morphe.keystore \
---keystore-entry-password=\"\" --keystore-password=\"\" --signer=Morphe_Xky --keystore-entry-alias=Morphe_Xky -t '$tmp_files' $patcher_args"
+--keystore-entry-password=changeit --keystore-password=changeit --signer=Morphe_Xky --keystore-entry-alias=Morphe_Xky -t '$tmp_files' $patcher_args"
 
 	local cli_name
 	cli_name=$(basename "$cli_jar")
