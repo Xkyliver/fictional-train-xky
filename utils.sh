@@ -370,7 +370,7 @@ merge_splits() {
 		return 1
 	fi
 	# sign the merged stock apk
-	if ! OP=$(java -jar "$APKSIGNER" sign --ks ks-p12.keystore --ks-pass pass:123456789 --key-pass pass:123456789 --ks-key-alias jhc \
+	if ! OP=$(java -jar "$APKSIGNER" sign --ks morphe.keystore --ks-pass pass: --key-pass pass:Morphe_Xky --ks-key-alias Morphe_Xky \
 		--out "${output}" "${output}-unsigned"); then
 		epr "apksigner error: $OP"
 		return 1
@@ -380,43 +380,10 @@ merge_splits() {
 }
 
 # -------------------- apkmirror --------------------
-apkmirror_search() {
-	local resp="$1" dpi="$2" arch="$3" apk_bundle="$4"
-	local dlurl="" node app_table emptyCheck
-
-	local apparch=('universal' 'noarch' 'arm64-v8a + armeabi-v7a')
-	if [ "$arch" != "all" ]; then
-		apparch+=("$arch")
-	fi
-
-	local appdpi=("nodpi" "anydpi")
-	if [ "$dpi" ]; then
-		appdpi+=($dpi)
-	fi
-
-	for ((n = 1; n < 40; n++)); do
-		node=$($HTMLQ "div.table-row.headerFont:nth-last-child($n)" -r "span:nth-child(n+3)" <<<"$resp")
-		if [ -z "$node" ]; then break; fi
-		emptyCheck=$($HTMLQ -t -w "div.table-cell:nth-child(1) > a:nth-child(1)" <<<"$node" | xargs)
-		if [ -z "$emptyCheck" ]; then break; fi
-		app_table=$($HTMLQ --text --ignore-whitespace <<<"$node")
-		if [ "$(sed -n 3p <<<"$app_table")" != "$apk_bundle" ]; then continue; fi
-		dlurl=$($HTMLQ --base https://www.apkmirror.com --attribute href "div:nth-child(1) > a:nth-child(1)" <<<"$node")
-		if isoneof "$(sed -n 6p <<<"$app_table")" "${appdpi[@]}" &&
-			isoneof "$(sed -n 4p <<<"$app_table")" "${apparch[@]}"; then
-			echo "$dlurl"
-			return 0
-		fi
-	done
-	if [ "$n" -eq 2 ] && [ "$dlurl" ]; then
-		# only one apk exists, return it
-		echo "$dlurl"
-		return 0
-	fi
-	return 1
-}
+# Uses scripts/download_apkmirror.py (cloudscraper + BeautifulSoup)
+APKMIRROR_PY="${APKMIRROR_PY:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/scripts/download_apkmirror.py}"
 dl_apkmirror() {
-	local url=$1 version=${2// /-} output=$3 arch=$4 dpi=$5 is_bundle=false
+	local url=$1 version=$2 output=$3 arch=$4 dpi=$5 out
 
 	if [ -f "${output}.apkm" ]; then
 		merge_splits "${output}.apkm" "${output}"
@@ -424,51 +391,21 @@ dl_apkmirror() {
 	fi
 
 	if [ "$arch" = "arm-v7a" ]; then arch="armeabi-v7a"; fi
-	local resp node app_table apkmname dlurl=""
-	apkmname=$($HTMLQ "h1.marginZero" --text <<<"$__APKMIRROR_RESP__")
-	apkmname="${apkmname,,}" apkmname="${apkmname// /-}" apkmname="${apkmname//[^a-z0-9-]/}"
-	url="${url}/${apkmname}-${version//./-}-release/"
-	resp=$(req "$url" -) || return 1
-	node=$($HTMLQ "div.table-row.headerFont:nth-last-child(1)" -r "span:nth-child(n+3)" <<<"$resp")
-	if [ "$node" ]; then
-		for type in APK BUNDLE; do
-			if dlurl=$(apkmirror_search "$resp" "$dpi" "$arch" "$type"); then
-				if [ "$type" = "BUNDLE" ]; then
-					is_bundle=true
-				else is_bundle=false; fi
-				break 2
-			fi
-		done
-		if [ -z "$dlurl" ]; then return 1; fi
-		resp=$(req "$dlurl" -)
-	fi
-	url=$(echo "$resp" | $HTMLQ --base https://www.apkmirror.com --attribute href "a.btn") || return 1
-	url=$(req "$url" - | $HTMLQ --base https://www.apkmirror.com --attribute href "span > a[rel = nofollow]") || return 1
+	# the script logs to stderr and prints only the final file path to stdout
+	out=$(python3 "$APKMIRROR_PY" "${url%/}" "$version" "$output" "${arch:-all}" "$dpi") || return 1
 
-	if [ "$is_bundle" = true ]; then
-		req "$url" "${output}.apkm" || return 1
-		merge_splits "${output}.apkm" "${output}"
-	else
-		req "$url" "${output}" || return 1
+	if [ "$out" = "${output}.apkm" ]; then
+		merge_splits "${output}.apkm" "${output}" || return 1
+	elif [ ! -f "$out" ]; then
+		return 1
 	fi
 }
-get_apkmirror_vers() {
-	local vers apkm_resp
-	apkm_resp=$(req "https://www.apkmirror.com/uploads/?appcategory=${__APKMIRROR_CAT__}" -)
-	vers=$(sed -n 's;.*Version:</span><span class="infoSlide-value">\(.*\) </span>.*;\1;p' <<<"$apkm_resp" | awk '{$1=$1}1')
-
-	vers=$(grep -iv "\(beta\|alpha\)" <<<"$vers")
-	local v r_vers=()
-	local IFS=$'\n'
-	for v in $vers; do
-		grep -iq "${v} \(beta\|alpha\)" <<<"$apkm_resp" || r_vers+=("$v")
-	done
-	echo "${r_vers[*]}"
-}
-get_apkmirror_pkg_name() { sed -n 's;.*id=\(.*\)" class="accent_color.*;\1;p' <<<"$__APKMIRROR_RESP__"; }
+get_apkmirror_vers() { python3 "$APKMIRROR_PY" --versions "$__APKMIRROR_URL__"; }
+get_apkmirror_pkg_name() { echo "$__APKMIRROR_PKG__"; }
 get_apkmirror_resp() {
-	__APKMIRROR_RESP__=$(req "${1}" -) || return 1
-	__APKMIRROR_CAT__="${1##*/}"
+	__APKMIRROR_URL__="${1%/}"
+	__APKMIRROR_PKG__=$(python3 "$APKMIRROR_PY" --pkg-name "$__APKMIRROR_URL__") || return 1
+	[ -n "$__APKMIRROR_PKG__" ]
 }
 
 # -------------------- uptodown --------------------
@@ -588,8 +525,8 @@ patch_apk() {
 	local tmp_files
 	tmp_files="$(pwd)/$(mktemp -d -p "$TEMP_DIR")"
 
-	local cmd="java -jar '$cli_jar' patch '$stock_input' -o '$patched_apk' -p '$patches_jar' --keystore=ks.keystore \
---keystore-entry-password=123456789 --keystore-password=123456789 --signer=jhc --keystore-entry-alias=jhc -t '$tmp_files' $patcher_args"
+	local cmd="java -jar '$cli_jar' patch '$stock_input' -o '$patched_apk' -p '$patches_jar' --keystore=morphe.keystore \
+--keystore-entry-password=Morphe_Xky --keystore-password="" --signer=Morphe_Xky --keystore-entry-alias=Morphe_Xky -t '$tmp_files' $patcher_args"
 
 	# TODO: remove this later
 	local cli_name

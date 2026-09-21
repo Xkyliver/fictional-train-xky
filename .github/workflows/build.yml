@@ -14,16 +14,22 @@ jobs:
     permissions: write-all
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/setup-java@v5
-        with:
-          distribution: "zulu"
-          java-version: "21"
-
+          steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
           submodules: true
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: "zulu"
+          java-version: "21"
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+      - run: pip install -r requirements.txt
 
       - name: Update config
         if: ${{ inputs.from_ci }}
