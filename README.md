@@ -36,7 +36,6 @@ Use [**zygisk-detach**](https://github.com/j-hc/zygisk-detach) to detach YouTube
 
 
 ## 📜 Credits
-
   - [MorpheApp/morphe-patches](https://github.com/MorpheApp/morphe-patches)
   - [MorpheApp/morphe-desktop](https://github.com/MorpheApp/morphe-desktop)
   - [j-hc/revanced-magisk-module](https://github.com/j-hc/revanced-magisk-module)
