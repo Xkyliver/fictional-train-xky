@@ -371,16 +371,8 @@ merge_splits() {
 		epr "APKEditor error: $OP"
 		return 1
 	fi
-	# convert BKS keystore to PKCS12 if needed, then sign
-	local ks_p12="$TEMP_DIR/morphe-p12.keystore"
-	if [ ! -f "$ks_p12" ]; then
-		keytool -importkeystore \
-			-srckeystore morphe.keystore -srcstoretype BKS -srcstorepass 123456789 -srcalias jhc \
-			-destkeystore "$ks_p12" -deststoretype PKCS12 -deststorepass 123456789 -destalias jhc \
-			-providerclass org.bouncycastle.jce.provider.BouncyCastleProvider \
-			-providerpath "$TEMP_DIR/bcprov.jar" -noprompt 2>/dev/null || return 1
-	fi
-	if ! OP=$(java -jar "$APKSIGNER" sign --ks "$ks_p12" --ks-pass pass:123456789 --key-pass pass:123456789 --ks-key-alias jhc \
+		# sign the merged stock apk
+	if ! OP=$(java -jar "$APKSIGNER" sign --ks morphe.keystore --ks-pass pass:Morphe_Xky --key-pass pass:Morphe_Xky --ks-key-alias Morphe_Xky \
 		--out "${output}" "${output}-unsigned"); then
 		epr "apksigner error: $OP"
 		return 1
