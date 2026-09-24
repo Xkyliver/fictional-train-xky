@@ -35,5 +35,5 @@ Extensive Morphe builder
   - [MorpheApp/morphe-patches](https://github.com/MorpheApp/morphe-patches)
   - [MorpheApp/morphe-desktop](https://github.com/MorpheApp/morphe-desktop)
   - [j-hc/revanced-magisk-module](https://github.com/j-hc/revanced-magisk-module)
-  - Claude and Gemini (This is vibe coded)
+  - Claude and Gemini (Made using AI)
   - [download_apkmirror.py](https://github.com/ikafly144/morphe-module/blob/main/download_apkmirror.py)
