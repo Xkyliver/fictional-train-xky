@@ -1,55 +1,93 @@
-name: Build Modules
+name: CI Build & Release
+
 on:
-  workflow_call:
+  schedule:
+    - cron: "0 18 * * *"
+  workflow_dispatch:
     inputs:
-      from_ci:
-        type: boolean
+      force_build:
+        description: 'Force build and release (ignore version checks)'
         required: false
-        default: true
+        type: boolean
+        default: false
 
 jobs:
-  run:
+  build-and-release:
     permissions: write-all
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/setup-java@v5
-        with:
-          distribution: "zulu"
-          java-version: "21"
-
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
           submodules: true
 
-      - name: Set up Python
-        uses: actions/setup-python@v7
+      - name: Should build?
+        id: check
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE_BUILD: ${{ inputs.force_build }}
+        run: |
+          if [ "$FORCE_BUILD" = "true" ]; then
+            echo "Force build requested!"
+            echo "SHOULD_BUILD=1" >> $GITHUB_OUTPUT
+          elif ! git ls-remote --exit-code --heads origin update >/dev/null 2>&1 || ! git checkout origin/update build.md 2>/dev/null; then
+            echo "First time building!"
+            echo "SHOULD_BUILD=1" >> $GITHUB_OUTPUT
+          else
+            UPDATE_CFG=$(./build.sh config.toml --config-update)
+            if [ "$UPDATE_CFG" ]; then
+              echo "'$UPDATE_CFG'"
+              echo "$UPDATE_CFG" > config.json
+              echo "SHOULD_BUILD=1" >> $GITHUB_OUTPUT
+            else
+              echo "SHOULD_BUILD=0" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Setup Java
+        if: steps.check.outputs.SHOULD_BUILD == '1'
+        uses: actions/setup-java@v4
+        with:
+          distribution: "zulu"
+          java-version: "21"
+
+      - name: Setup Python
+        if: steps.check.outputs.SHOULD_BUILD == '1'
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: 'pip'
 
       - name: Install scraper requirements
+        if: steps.check.outputs.SHOULD_BUILD == '1'
         run: |
           python3 -m pip install --upgrade pip
           pip3 install cloudscraper beautifulsoup4
 
-      - name: Setup BouncyCastle Provider for Java 21
+      - name: Cache Build Tools
+        if: steps.check.outputs.SHOULD_BUILD == '1'
+        uses: actions/cache@v4
+        with:
+          path: |
+            bin/
+            temp/
+          key: ${{ runner.os }}-build-tools-${{ hashFiles('**/build.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-build-tools-
+
+      - name: Setup BouncyCastle Provider
+        if: steps.check.outputs.SHOULD_BUILD == '1'
         run: |
           mkdir -p temp
-          curl -L -o temp/bcprov.jar https://repo1.maven.org/maven2/org/bouncycastle/bcprov-jdk18on/1.78/bcprov-jdk18on-1.78.jar
+          if [ ! -f "temp/bcprov.jar" ]; then
+            curl -L -o temp/bcprov.jar https://repo1.maven.org/maven2/org/bouncycastle/bcprov-jdk18on/1.78/bcprov-jdk18on-1.78.jar
+          fi
           sudo cp temp/bcprov.jar /usr/lib/jvm/zulu21/lib/ 2>/dev/null || sudo cp temp/bcprov.jar "$JAVA_HOME/lib/" || :
 
-      - name: Update config
-        if: ${{ inputs.from_ci }}
-        run: |
-          if git checkout origin/update build.md; then
-            UPDATE_CFG=$(./build.sh config.toml --config-update)
-            if [ "$UPDATE_CFG" ]; then
-              echo "$UPDATE_CFG" > config.json
-            fi
-          fi
-
       - name: Get next version code
+        if: steps.check.outputs.SHOULD_BUILD == '1'
         id: next_ver_code
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -59,12 +97,14 @@ jobs:
           echo "NEXT_VER_CODE=$((TAG + 1))" >> $GITHUB_OUTPUT
 
       - name: Build modules/APKs
+        if: steps.check.outputs.SHOULD_BUILD == '1'
         run: if [ -f "config.json" ]; then ./build.sh config.json; else ./build.sh config.toml; fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NEXT_VER_CODE: ${{ steps.next_ver_code.outputs.NEXT_VER_CODE }}
 
       - name: Get output
+        if: steps.check.outputs.SHOULD_BUILD == '1'
         id: get_output
         run: |
           DELIM="$(openssl rand -hex 8)"
@@ -74,13 +114,15 @@ jobs:
           cp -f build.md build.tmp
 
       - name: Get patches version for title
+        if: steps.check.outputs.SHOULD_BUILD == '1'
         id: patches_ver
         run: |
           PV=$(grep -m1 '^Patches: ' build.md | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-          if [ -z "$PV" ]; then PV="$TAG"; fi
+          if [ -z "$PV" ]; then PV="${{ steps.next_ver_code.outputs.NEXT_VER_CODE }}"; fi
           echo "VER=$PV" >> "$GITHUB_OUTPUT"
 
       - name: Upload release
+        if: steps.check.outputs.SHOULD_BUILD == '1'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.next_ver_code.outputs.NEXT_VER_CODE }}
@@ -95,6 +137,7 @@ jobs:
           fi
 
       - name: Update modules changelog and update json
+        if: steps.check.outputs.SHOULD_BUILD == '1'
         id: update_config
         run: |
           git checkout -f update || git switch --discard-changes --orphan update
@@ -124,6 +167,7 @@ jobs:
           find . -name "*-update.json" | grep . || : >dummy-update.json
 
       - name: Commit module json changes
+        if: steps.check.outputs.SHOULD_BUILD == '1'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -137,10 +181,17 @@ jobs:
             echo "no changes!"
           fi
 
+      - name: Clear older runs
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh run list -L400 --json databaseId -q '.[].databaseId' | tail -n+10 | xargs -IID gh api "repos/$GITHUB_REPOSITORY/actions/runs/ID" -X DELETE || :
+
       - name: Report to Telegram
+        if: steps.check.outputs.SHOULD_BUILD == '1' && env.TG_TOKEN != null
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
-        if: env.TG_TOKEN != null
         run: |
           cd build || { echo "build folder not found"; exit 1; }
 
