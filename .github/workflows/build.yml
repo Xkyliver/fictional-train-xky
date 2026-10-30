@@ -92,9 +92,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG=$(gh release list -L 1 | awk -F '\t' '{print $3}')
-          if [ -z "$TAG" ]; then TAG=0; fi
-          echo "NEXT_VER_CODE=$((TAG + 1))" >> $GITHUB_OUTPUT
+          # Extract all purely numeric tags, find the maximum, and increment
+          HIGHEST_TAG=$(gh release list -L 100 --json tagName -q '.[].tagName' | grep -E '^[0-9]+$' | sort -n | tail -n 1)
+          if [ -z "$HIGHEST_TAG" ]; then
+            NEXT_TAG=1
+          else
+            NEXT_TAG=$((HIGHEST_TAG + 1))
+          fi
+          echo "NEXT_VER_CODE=$NEXT_TAG" >> $GITHUB_OUTPUT
+          echo "Selected Release Tag: $NEXT_TAG"
 
       - name: Build modules/APKs
         if: steps.check.outputs.SHOULD_BUILD == '1'
@@ -129,12 +135,8 @@ jobs:
           BODY: ${{ steps.get_output.outputs.BUILD_LOG }}
           VER: ${{ steps.patches_ver.outputs.VER }}
         run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release edit "$TAG" --title "$VER" --notes "$BODY"
-            gh release upload "$TAG" ./build/* --clobber
-          else
-            gh release create "$TAG" ./build/* --title "$VER" --notes "$BODY"
-          fi
+          # Always create a new release under the incremented tag
+          gh release create "$TAG" ./build/* --title "$VER ($TAG)" --notes "$BODY"
 
       - name: Update modules changelog and update json
         if: steps.check.outputs.SHOULD_BUILD == '1'
