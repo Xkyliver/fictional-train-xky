@@ -31,27 +31,76 @@ jobs:
           fetch-depth: 0
           submodules: true
 
+      - name: Verify latest stable Morphe releases
+        id: morphe
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          get_stable_tag() {
+            local repo="$1"
+            local release tag
+            release="$(gh api "repos/${repo}/releases/latest")"
+            tag="$(jq -r '.tag_name // empty' <<<"$release")"
+
+            if [ -z "$tag" ] ||
+               [ "$(jq -r '.draft' <<<"$release")" != "false" ] ||
+               [ "$(jq -r '.prerelease' <<<"$release")" != "false" ] ||
+               [[ "$tag" =~ (dev|alpha|beta|rc) ]]; then
+              echo "::error::Refusing non-stable or invalid release for ${repo}: ${tag:-missing tag}"
+              return 1
+            fi
+
+            printf '%s' "$tag"
+          }
+
+          PATCHES_TAG="$(get_stable_tag MorpheApp/morphe-patches)"
+          CLI_TAG="$(get_stable_tag MorpheApp/morphe-desktop)"
+
+          echo "patches_tag=$PATCHES_TAG" >> "$GITHUB_OUTPUT"
+          echo "cli_tag=$CLI_TAG" >> "$GITHUB_OUTPUT"
+          echo "Latest stable Morphe Patches: $PATCHES_TAG"
+          echo "Latest stable Morphe Desktop CLI: $CLI_TAG"
+
+          # This workflow must always resolve versions dynamically from stable releases.
+          if grep -Eiq '^[[:space:]]*(patches-version|cli-version)[[:space:]]*=' config.toml; then
+            echo "::error::Remove explicit patches-version/cli-version overrides from config.toml; they can pin or select non-latest builds."
+            exit 1
+          fi
+
       - name: Should build?
         id: check
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FORCE_BUILD: ${{ inputs.force_build }}
+          MORPHE_PATCHES_TAG: ${{ steps.morphe.outputs.patches_tag }}
+          MORPHE_CLI_TAG: ${{ steps.morphe.outputs.cli_tag }}
         run: |
           if [ "$FORCE_BUILD" = "true" ]; then
             echo "Force build requested!"
             echo "SHOULD_BUILD=1" >> $GITHUB_OUTPUT
-          elif ! git ls-remote --exit-code --heads origin update >/dev/null 2>&1 || ! git checkout origin/update build.md 2>/dev/null; then
+          elif ! git ls-remote --exit-code --heads origin update >/dev/null 2>&1 || ! git checkout origin/update -- build.md 2>/dev/null; then
             echo "First time building!"
             echo "SHOULD_BUILD=1" >> $GITHUB_OUTPUT
           else
-            UPDATE_CFG=$(./build.sh config.toml --config-update)
-            if [ "$UPDATE_CFG" ]; then
-              echo "'$UPDATE_CFG'"
-              echo "$UPDATE_CFG" > config.json
-              echo "SHOULD_BUILD=1" >> $GITHUB_OUTPUT
+            PREVIOUS_PATCHES_TAG=$(git show origin/update:morphe-stable-versions.txt 2>/dev/null | sed -n 's/^patches=//p' || true)
+            PREVIOUS_CLI_TAG=$(git show origin/update:morphe-stable-versions.txt 2>/dev/null | sed -n 's/^cli=//p' || true)
+
+            if [ "$MORPHE_PATCHES_TAG" != "$PREVIOUS_PATCHES_TAG" ] || [ "$MORPHE_CLI_TAG" != "$PREVIOUS_CLI_TAG" ]; then
+              echo "A newer stable Morphe release is available."
+              echo "SHOULD_BUILD=1" >> "$GITHUB_OUTPUT"
             else
-              echo "SHOULD_BUILD=0" >> $GITHUB_OUTPUT
+              UPDATE_CFG=$(./build.sh config.toml --config-update)
+              if [ "$UPDATE_CFG" ]; then
+                echo "'$UPDATE_CFG'"
+                echo "$UPDATE_CFG" > config.json
+                echo "SHOULD_BUILD=1" >> "$GITHUB_OUTPUT"
+              else
+                echo "SHOULD_BUILD=0" >> "$GITHUB_OUTPUT"
+              fi
             fi
           fi
 
@@ -83,7 +132,6 @@ jobs:
         with:
           path: |
             bin/
-            temp/
           key: ${{ runner.os }}-build-tools-${{ hashFiles('**/build.sh') }}
           restore-keys: |
             ${{ runner.os }}-build-tools-
@@ -135,6 +183,14 @@ jobs:
             command -v xvfb-run >/dev/null || sudo apt-get install -y --no-install-recommends xvfb
           fi
 
+      - name: Clear cached Morphe prebuilts
+        if: steps.check.outputs.SHOULD_BUILD == '1'
+        shell: bash
+        run: |
+          # get_prebuilts() searches these directories before downloading.
+          # Clearing them guarantees the current stable release is fetched.
+          rm -rf temp/*-rv
+
       - name: Build modules/APKs
         if: steps.check.outputs.SHOULD_BUILD == '1'
         run: if [ -f "config.json" ]; then ./build.sh config.json; else ./build.sh config.toml; fi
@@ -177,6 +233,11 @@ jobs:
         run: |
           git checkout -f update || git switch --discard-changes --orphan update
           cp -f build.tmp build.md
+          {
+            echo "patches=${{ steps.morphe.outputs.patches_tag }}"
+            echo "cli=${{ steps.morphe.outputs.cli_tag }}"
+          } > morphe-stable-versions.txt
+
           get_update_json() {
             echo "{
             \"version\": \"$1\",
@@ -207,7 +268,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add build.md *-update.json
+          git add build.md morphe-stable-versions.txt *-update.json
 
           if ! git diff --cached --quiet; then
             git commit -m "Bump version ${{ steps.next_ver_code.outputs.NEXT_VER_CODE }}"
