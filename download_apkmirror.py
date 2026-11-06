@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-APKMirror Helper using cloudscraper & BeautifulSoup
-Replicates the reliable download mechanism used by crimera/twitter-apk and ikafly144/piko-module
+APKMirror Helper: curl_cffi -> cloudscraper -> real-browser fallback
 """
 import sys
 import os
@@ -9,16 +8,105 @@ import re
 import time
 import argparse
 import urllib.parse
-import cloudscraper
 from bs4 import BeautifulSoup
 
+try:
+    from curl_cffi import requests as curl_requests  # TLS/JA3 impersonation
+except ImportError:
+    curl_requests = None
+try:
+    import cloudscraper
+except ImportError:
+    cloudscraper = None
+
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+
+# Used when APKMirror is unreachable, so the build at least gets a pkg name
+KNOWN_PKGS = {
+    "youtube": "com.google.android.youtube",
+    "youtube-music": "com.google.android.apps.youtube.music",
+    "reddit": "com.reddit.frontpage",
+    "twitter": "com.twitter.android",
+    "tiktok": "com.zhiliaoapp.musically",
+}
+
+
+class Fetcher:
+    """HTTP client that escalates when Cloudflare blocks us:
+    curl_cffi (Chrome TLS fingerprint) -> cloudscraper -> real browser
+    (SeleniumBase UC mode under xvfb) to get cf_clearance, whose cookies are
+    then reused for fast requests. Set APKMIRROR_PROXY to route via a proxy.
+    """
+
+    def __init__(self):
+        self.proxy = os.environ.get("APKMIRROR_PROXY") or None
+        self.ua = UA
+        self.cookies = {}
+        self.browser_done = False
+        self._build_session()
+
+    def _build_session(self):
+        proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
+        if curl_requests:
+            self.kind = "curl_cffi"
+            self.session = curl_requests.Session(impersonate="chrome", proxies=proxies)
+        elif cloudscraper:
+            self.kind = "cloudscraper"
+            self.session = cloudscraper.create_scraper()
+            if proxies:
+                self.session.proxies.update(proxies)
+        else:
+            raise RuntimeError("Install curl_cffi (pip install curl_cffi) or cloudscraper")
+        self.session.headers.update({"User-Agent": self.ua, "Accept-Language": "en-US,en;q=0.9"})
+        for k, v in self.cookies.items():
+            self.session.cookies.set(k, v, domain=".apkmirror.com")
+
+    def _solve_with_browser(self, url):
+        if self.browser_done:
+            return False
+        self.browser_done = True
+        try:
+            from seleniumbase import SB
+        except ImportError:
+            print("seleniumbase not installed, cannot solve Cloudflare challenge "
+                  "(pip install seleniumbase)", file=sys.stderr)
+            return False
+        print("Blocked by Cloudflare, solving with a real browser...", file=sys.stderr)
+        try:
+            kw = dict(uc=True, test=True, headless=False, xvfb=True, locale_code="en")
+            if self.proxy:
+                kw["proxy"] = self.proxy.replace("http://", "").replace("https://", "")
+            with SB(**kw) as sb:
+                sb.uc_open_with_reconnect(url, reconnect_time=6)
+                for _ in range(4):
+                    if "just a moment" not in sb.get_title().lower():
+                        break
+                    try:
+                        sb.uc_gui_click_captcha()
+                    except Exception:
+                        pass
+                    sb.sleep(4)
+                self.ua = sb.execute_script("return navigator.userAgent")
+                self.cookies = {c["name"]: c["value"] for c in sb.driver.get_cookies()}
+            ok = "cf_clearance" in self.cookies
+            print(f"Browser solve {'succeeded' if ok else 'did not get cf_clearance'}", file=sys.stderr)
+            self._build_session()
+            return ok
+        except Exception as e:
+            print(f"Browser solve failed: {e}", file=sys.stderr)
+            return False
+
+    def get(self, url, headers=None, stream=False):
+        r = self.session.get(url, headers=headers or {}, stream=stream, timeout=60)
+        if r.status_code in (403, 503) and self._solve_with_browser(url):
+            r = self.session.get(url, headers=headers or {}, stream=stream, timeout=60)
+        return r
+
+
 def get_scraper():
-    scraper = cloudscraper.create_scraper()
-    scraper.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-    })
-    return scraper
+    return Fetcher()
+
 
 def safe_get(scraper, url: str, referer: str = None, max_retries: int = 3):
     headers = {}
@@ -64,9 +152,8 @@ def get_pkg_name(scraper, base_url: str) -> str:
                         return m.group(1)
     except Exception:
         pass
-    if "twitter" in base_url.lower():
-        return "com.twitter.android"
-    return ""
+    slug = base_url.rstrip("/").split("/")[-1].lower()
+    return KNOWN_PKGS.get(slug, "")
 
 def get_versions_list(scraper, base_url: str) -> list[str]:
     r = safe_get(scraper, base_url)
@@ -210,15 +297,18 @@ def download_file(scraper, direct_url: str, referer: str, out_path: str):
     dir_name = os.path.dirname(out_path)
     if dir_name:
         os.makedirs(dir_name, exist_ok=True)
-    
+
     headers = {"Referer": referer}
     print(f"Downloading from {direct_url} -> {out_path}", file=sys.stderr)
-    with scraper.get(direct_url, stream=True, headers=headers) as r:
+    r = scraper.get(direct_url, stream=True, headers=headers)
+    try:
         r.raise_for_status()
         with open(out_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=65536):
                 if chunk:
                     f.write(chunk)
+    finally:
+        r.close()
     print(f"Downloaded successfully: {out_path} ({os.path.getsize(out_path)} bytes)", file=sys.stderr)
 
 def download_apkmirror(base_url: str, version: str, output: str, arch: str = "all", dpi: str = ""):
