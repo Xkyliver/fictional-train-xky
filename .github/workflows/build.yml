@@ -102,6 +102,12 @@ jobs:
           echo "NEXT_VER_CODE=$NEXT_TAG" >> $GITHUB_OUTPUT
           echo "Selected Release Tag: $NEXT_TAG"
 
+      - name: Install downloader deps
+        if: steps.check.outputs.SHOULD_BUILD == '1'
+        run: |
+          pip install curl_cffi seleniumbase beautifulsoup4
+          sudo apt-get update && sudo apt-get install -y xvfb
+
       - name: Build modules/APKs
         if: steps.check.outputs.SHOULD_BUILD == '1'
         run: if [ -f "config.json" ]; then ./build.sh config.json; else ./build.sh config.toml; fi
