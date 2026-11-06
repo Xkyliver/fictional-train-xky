@@ -11,10 +11,19 @@ on:
         type: boolean
         default: false
 
+concurrency:
+  group: build-and-release
+  cancel-in-progress: false
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONUNBUFFERED: "1"
+
 jobs:
   build-and-release:
     permissions: write-all
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -50,7 +59,7 @@ jobs:
         if: steps.check.outputs.SHOULD_BUILD == '1'
         uses: actions/setup-java@v4
         with:
-          distribution: "zulu"
+          distribution: "temurin"
           java-version: "21"
 
       - name: Setup Python
@@ -58,13 +67,15 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          cache: 'pip'
 
-      - name: Install scraper requirements
+      - name: Cache pip
         if: steps.check.outputs.SHOULD_BUILD == '1'
-        run: |
-          python3 -m pip install --upgrade pip
-          pip3 install cloudscraper beautifulsoup4
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-dl-v1
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
       - name: Cache Build Tools
         if: steps.check.outputs.SHOULD_BUILD == '1'
@@ -105,8 +116,24 @@ jobs:
       - name: Install downloader deps
         if: steps.check.outputs.SHOULD_BUILD == '1'
         run: |
-          pip install curl_cffi seleniumbase beautifulsoup4
-          sudo apt-get update && sudo apt-get install -y xvfb
+          pip install curl_cffi beautifulsoup4
+          # Only pull in the heavy browser stack if APKMirror blocks this runner
+          if python3 - <<'PY'
+          import sys
+          from curl_cffi import requests
+          try:
+              r = requests.get("https://www.apkmirror.com/apk/google-inc/youtube/", impersonate="chrome", timeout=30)
+              sys.exit(0 if r.status_code == 200 else 1)
+          except Exception:
+              sys.exit(1)
+          PY
+          then
+            echo "APKMirror reachable without a browser"
+          else
+            echo "Blocked, installing browser fallback"
+            pip install seleniumbase
+            command -v xvfb-run >/dev/null || sudo apt-get install -y --no-install-recommends xvfb
+          fi
 
       - name: Build modules/APKs
         if: steps.check.outputs.SHOULD_BUILD == '1'
@@ -194,7 +221,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh run list -L400 --json databaseId -q '.[].databaseId' | tail -n+10 | xargs -IID gh api "repos/$GITHUB_REPOSITORY/actions/runs/ID" -X DELETE || :
+          gh run list -L400 --json databaseId -q '.[].databaseId' | tail -n+10 | xargs -P8 -IID gh api "repos/$GITHUB_REPOSITORY/actions/runs/ID" -X DELETE || :
 
       - name: Report to Telegram
         if: steps.check.outputs.SHOULD_BUILD == '1' && env.TG_TOKEN != null
