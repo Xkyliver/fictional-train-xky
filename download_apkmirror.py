@@ -8,6 +8,10 @@ import re
 import time
 import argparse
 import urllib.parse
+import json
+import hashlib
+import tempfile
+import fcntl
 from bs4 import BeautifulSoup
 
 try:
@@ -32,6 +36,19 @@ KNOWN_PKGS = {
 }
 
 
+CACHE_DIR = os.environ.get("APKMIRROR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "apkmirror_cache")
+PAGE_TTL = 900     # seconds a cached HTML page stays valid
+COOKIE_TTL = 3000  # seconds a cached cf_clearance is trusted
+
+
+class CachedResponse:
+    status_code = 200
+
+    def __init__(self, text):
+        self.text = text
+        self.content = text.encode("utf-8")
+
+
 class Fetcher:
     """HTTP client that escalates when Cloudflare blocks us:
     curl_cffi (Chrome TLS fingerprint) -> cloudscraper -> real browser
@@ -44,7 +61,52 @@ class Fetcher:
         self.ua = UA
         self.cookies = {}
         self.browser_done = False
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        self._load_cookies()
         self._build_session()
+
+    # ---- cross-process cookie cache: the browser solve only happens once ----
+    def _cookie_file(self):
+        return os.path.join(CACHE_DIR, "cf.json")
+
+    def _load_cookies(self):
+        try:
+            with open(self._cookie_file()) as f:
+                d = json.load(f)
+            if time.time() - d["ts"] < COOKIE_TTL and d.get("cookies"):
+                self.cookies, self.ua = d["cookies"], d["ua"]
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _save_cookies(self):
+        try:
+            with open(self._cookie_file(), "w") as f:
+                json.dump({"ts": time.time(), "cookies": self.cookies, "ua": self.ua}, f)
+        except Exception:
+            pass
+
+    # ---- short-lived page cache: same listing page is fetched by several calls ----
+    def _page_file(self, url):
+        return os.path.join(CACHE_DIR, hashlib.sha1(url.encode()).hexdigest() + ".html")
+
+    def _page_get(self, url):
+        fp = self._page_file(url)
+        try:
+            if time.time() - os.path.getmtime(fp) < PAGE_TTL:
+                with open(fp, encoding="utf-8") as f:
+                    return CachedResponse(f.read())
+        except Exception:
+            pass
+        return None
+
+    def _page_put(self, url, r):
+        try:
+            with open(self._page_file(url), "w", encoding="utf-8") as f:
+                f.write(r.text)
+        except Exception:
+            pass
 
     def _build_session(self):
         proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
@@ -66,6 +128,20 @@ class Fetcher:
         if self.browser_done:
             return False
         self.browser_done = True
+        # serialize across parallel processes; if another one already solved, reuse it
+        lock = open(os.path.join(CACHE_DIR, "solve.lock"), "w")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            old = dict(self.cookies)
+            if self._load_cookies() and self.cookies != old:
+                self._build_session()
+                return True
+            return self._do_solve(url)
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            lock.close()
+
+    def _do_solve(self, url):
         try:
             from seleniumbase import SB
         except ImportError:
@@ -78,7 +154,7 @@ class Fetcher:
             if self.proxy:
                 kw["proxy"] = self.proxy.replace("http://", "").replace("https://", "")
             with SB(**kw) as sb:
-                sb.uc_open_with_reconnect(url, reconnect_time=6)
+                sb.uc_open_with_reconnect(url, reconnect_time=3)
                 for _ in range(4):
                     if "just a moment" not in sb.get_title().lower():
                         break
@@ -86,11 +162,13 @@ class Fetcher:
                         sb.uc_gui_click_captcha()
                     except Exception:
                         pass
-                    sb.sleep(4)
+                    sb.sleep(2)
                 self.ua = sb.execute_script("return navigator.userAgent")
                 self.cookies = {c["name"]: c["value"] for c in sb.driver.get_cookies()}
             ok = "cf_clearance" in self.cookies
             print(f"Browser solve {'succeeded' if ok else 'did not get cf_clearance'}", file=sys.stderr)
+            if ok:
+                self._save_cookies()
             self._build_session()
             return ok
         except Exception as e:
@@ -98,9 +176,15 @@ class Fetcher:
             return False
 
     def get(self, url, headers=None, stream=False):
+        if not stream:
+            cached = self._page_get(url)
+            if cached:
+                return cached
         r = self.session.get(url, headers=headers or {}, stream=stream, timeout=60)
         if r.status_code in (403, 503) and self._solve_with_browser(url):
             r = self.session.get(url, headers=headers or {}, stream=stream, timeout=60)
+        if not stream and r.status_code == 200:
+            self._page_put(url, r)
         return r
 
 
