@@ -39,6 +39,8 @@ KNOWN_PKGS = {
 CACHE_DIR = os.environ.get("APKMIRROR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "apkmirror_cache")
 PAGE_TTL = 900     # seconds a cached HTML page stays valid
 COOKIE_TTL = 3000  # seconds a cached cf_clearance is trusted
+# Browser profiles tried in order when Cloudflare answers 403/503
+IMPERSONATE = ["chrome", "safari", "firefox", "edge"]
 
 
 class CachedResponse:
@@ -61,6 +63,8 @@ class Fetcher:
         self.ua = UA
         self.cookies = {}
         self.browser_done = False
+        self.imp_idx = 0       # index into IMPERSONATE
+        self.had_success = False
         os.makedirs(CACHE_DIR, exist_ok=True)
         self._load_cookies()
         self._build_session()
@@ -112,7 +116,15 @@ class Fetcher:
         proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
         if curl_requests:
             self.kind = "curl_cffi"
-            self.session = curl_requests.Session(impersonate="chrome", proxies=proxies)
+            self.session = None
+            while self.imp_idx < len(IMPERSONATE):
+                try:
+                    self.session = curl_requests.Session(impersonate=IMPERSONATE[self.imp_idx], proxies=proxies)
+                    break
+                except Exception:   # profile unknown to this curl_cffi version
+                    self.imp_idx += 1
+            if self.session is None:
+                raise RuntimeError("No usable curl_cffi impersonation profile")
         elif cloudscraper:
             self.kind = "cloudscraper"
             self.session = cloudscraper.create_scraper()
@@ -120,9 +132,37 @@ class Fetcher:
                 self.session.proxies.update(proxies)
         else:
             raise RuntimeError("Install curl_cffi (pip install curl_cffi) or cloudscraper")
-        self.session.headers.update({"User-Agent": self.ua, "Accept-Language": "en-US,en;q=0.9"})
+        self.session.headers.update({"Accept-Language": "en-US,en;q=0.9"})
+        # IMPORTANT: never override User-Agent for curl_cffi unless we hold browser
+        # cookies. A hard-coded UA that disagrees with the impersonated TLS/HTTP2
+        # fingerprint is exactly what makes Cloudflare answer 403.
+        # cf_clearance, however, is bound to the UA of the browser that solved it.
+        if self.cookies:
+            self.session.headers.update({"User-Agent": self.ua})
+        elif self.kind == "cloudscraper":
+            self.session.headers.update({"User-Agent": self.ua})
         for k, v in self.cookies.items():
             self.session.cookies.set(k, v, domain=".apkmirror.com")
+
+    def _rotate_profile(self):
+        """Switch to the next TLS fingerprint. Only while nothing has worked yet."""
+        if self.kind != "curl_cffi" or self.had_success or self.cookies:
+            return False
+        if self.imp_idx + 1 >= len(IMPERSONATE):
+            return False
+        self.imp_idx += 1
+        print(f"Blocked, retrying as '{IMPERSONATE[self.imp_idx]}'", file=sys.stderr)
+        self._build_session()
+        return True
+
+    @staticmethod
+    def _norm(url):
+        # APKMirror directory pages are canonical with a trailing slash
+        u = urllib.parse.urlsplit(url)
+        if u.netloc.endswith("apkmirror.com") and not u.query and not u.path.endswith("/") \
+                and "." not in u.path.rsplit("/", 1)[-1]:
+            return urllib.parse.urlunsplit((u.scheme, u.netloc, u.path + "/", "", ""))
+        return url
 
     def _solve_with_browser(self, url):
         if self.browser_done:
@@ -176,15 +216,21 @@ class Fetcher:
             return False
 
     def get(self, url, headers=None, stream=False):
+        url = self._norm(url)
         if not stream:
             cached = self._page_get(url)
             if cached:
                 return cached
-        r = self.session.get(url, headers=headers or {}, stream=stream, timeout=60)
+        do = lambda: self.session.get(url, headers=headers or {}, stream=stream, timeout=60)
+        r = do()
+        while r.status_code in (403, 503) and self._rotate_profile():
+            r = do()
         if r.status_code in (403, 503) and self._solve_with_browser(url):
-            r = self.session.get(url, headers=headers or {}, stream=stream, timeout=60)
-        if not stream and r.status_code == 200:
-            self._page_put(url, r)
+            r = do()
+        if r.status_code == 200:
+            self.had_success = True
+            if not stream:
+                self._page_put(url, r)
         return r
 
 
@@ -388,12 +434,23 @@ def download_file(scraper, direct_url: str, referer: str, out_path: str):
     try:
         r.raise_for_status()
         with open(out_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=65536):
+            for chunk in r.iter_content(chunk_size=1 << 20):
                 if chunk:
                     f.write(chunk)
     finally:
         r.close()
     print(f"Downloaded successfully: {out_path} ({os.path.getsize(out_path)} bytes)", file=sys.stderr)
+
+def parse_size_bytes(soup):
+    """File size (bytes) shown on a variant / download page, or None."""
+    text = soup.get_text(" ", strip=True)
+    m = re.search(r"File size:\s*[\d.,]+\s*[KMG]B\s*\(([\d,]+)\s*bytes\)", text, re.I)
+    if m:
+        return int(m.group(1).replace(",", ""))
+    m = re.search(r"File size:\s*([\d.,]+)\s*([KMG])B", text, re.I)
+    if m:
+        return int(float(m.group(1).replace(",", "")) * 1024 ** ("KMG".index(m.group(2).upper()) + 1))
+    return None
 
 def download_apkmirror(base_url: str, version: str, output: str, arch: str = "all", dpi: str = ""):
     scraper = get_scraper()
@@ -436,11 +493,14 @@ def download_apkmirror(base_url: str, version: str, output: str, arch: str = "al
                     variant_arch = c_text
                     break
             
+            variant_dpi = " ".join(c.get_text(strip=True).lower() for c in cells
+                                   if "dpi" in c.get_text(strip=True).lower())
             variant_url = "https://www.apkmirror.com" + href if href.startswith("/") else href
             raw_variants.append({
                 "is_bundle": is_bundle,
                 "url": variant_url,
-                "arch": variant_arch
+                "arch": variant_arch,
+                "dpi": variant_dpi
             })
     
     # Fallback: check all -apk-download links directly on page
@@ -452,7 +512,8 @@ def download_apkmirror(base_url: str, version: str, output: str, arch: str = "al
                 raw_variants.append({
                     "is_bundle": "bundle" in href.lower(),
                     "url": variant_url,
-                    "arch": "universal"
+                    "arch": "universal",
+                    "dpi": ""
                 })
     
     # If no variants in table, check if page itself has downloadButton
@@ -465,33 +526,47 @@ def download_apkmirror(base_url: str, version: str, output: str, arch: str = "al
                 raw_variants.append({
                     "is_bundle": False,
                     "url": variant_url,
-                    "arch": "universal"
+                    "arch": "universal",
+                    "dpi": ""
                 })
     
     if not raw_variants:
         raise Exception(f"No variants found for {version}")
     
-    # Sort variants by priority
+    # ---- variant selection: compatible with the target arch, then SMALLEST size ----
     target_arch = arch.lower() if arch else "all"
     v_parts = version.split('.')
     sub_ver = v_parts[-1] if len(v_parts) > 3 else ""
-    
-    def variant_score(v):
-        score = 0
-        if v["is_bundle"]:
-            score += 10
-        if target_arch in ("all", "both"):
-            score += 10
-        elif target_arch in v["arch"]:
-            score += 50
-        elif "universal" in v["arch"] or "noarch" in v["arch"]:
-            score += 25
-        if sub_ver and sub_ver in v["url"]:
-            score += 100
-        return score
+    dpi_l = (dpi or "").lower()
 
-    ordered_variants = sorted(raw_variants, key=variant_score, reverse=True)
-    
+    def compatible(v):
+        if target_arch in ("all", "both"):
+            return True
+        return target_arch in v["arch"] or "universal" in v["arch"] or "noarch" in v["arch"]
+
+    pool = [v for v in raw_variants if compatible(v)] or raw_variants
+    if sub_ver:  # exact build requested (e.g. 4-part version): keep only that build if present
+        exact = [v for v in pool if sub_ver in v["url"]]
+        pool = exact or pool
+    if dpi_l and dpi_l != "nodpi":
+        pool = [v for v in pool if dpi_l in v["dpi"]] or pool
+
+    # Variant pages are fetched once here (and served from the page cache later)
+    for v in pool:
+        v["size"] = None
+        if len(pool) > 1:
+            rv = safe_get(scraper, v["url"], referer=version_url)
+            if rv and rv.status_code == 200:
+                v["size"] = parse_size_bytes(BeautifulSoup(rv.content, "html.parser"))
+        print(f"  candidate: arch={v['arch']} bundle={v['is_bundle']} "
+              f"size={v['size'] if v['size'] is not None else '?'} {v['url']}", file=sys.stderr)
+
+    # smallest first; unknown size last; on ties prefer plain APK over bundle, then exact arch
+    ordered_variants = sorted(pool, key=lambda v: (
+        v["size"] is None, v["size"] or 0, v["is_bundle"], target_arch not in v["arch"]))
+    # anything filtered out stays as a last-resort fallback
+    ordered_variants += [v for v in raw_variants if v not in ordered_variants]
+
     last_err = None
     for idx, selected in enumerate(ordered_variants):
         print(f"Trying variant {idx+1}/{len(ordered_variants)} (bundle={selected['is_bundle']}, arch={selected['arch']}): {selected['url']}", file=sys.stderr)
