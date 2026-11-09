@@ -106,7 +106,7 @@ jobs:
 
       - name: Setup Java
         if: steps.check.outputs.SHOULD_BUILD == '1'
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: "temurin"
           java-version: "21"
@@ -165,14 +165,17 @@ jobs:
         if: steps.check.outputs.SHOULD_BUILD == '1'
         run: |
           pip install curl_cffi beautifulsoup4
-          # Only pull in the heavy browser stack if APKMirror blocks this runner
+          # Probe with the real downloader client (same TLS profile/headers as the build).
+          # Only pull in the heavy browser stack if APKMirror blocks this runner.
           if python3 - <<'PY'
           import sys
-          from curl_cffi import requests
+          from download_apkmirror import get_scraper
           try:
-              r = requests.get("https://www.apkmirror.com/apk/google-inc/youtube/", impersonate="chrome", timeout=30)
+              r = get_scraper().get("https://www.apkmirror.com/apk/google-inc/youtube/")
+              print("probe status:", r.status_code)
               sys.exit(0 if r.status_code == 200 else 1)
-          except Exception:
+          except Exception as e:
+              print("probe failed:", e)
               sys.exit(1)
           PY
           then
@@ -180,7 +183,7 @@ jobs:
           else
             echo "Blocked, installing browser fallback"
             pip install seleniumbase
-            command -v xvfb-run >/dev/null || sudo apt-get install -y --no-install-recommends xvfb
+            command -v xvfb-run >/dev/null || { sudo apt-get update -qq; sudo apt-get install -y --no-install-recommends xvfb; }
           fi
 
       - name: Clear cached Morphe prebuilts
