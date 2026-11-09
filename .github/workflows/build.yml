@@ -10,6 +10,11 @@ on:
         required: false
         type: boolean
         default: false
+      release:
+        description: 'Publish the built APK(s)/module as a GitHub release (off = build only, files kept as a workflow artifact)'
+        required: false
+        type: boolean
+        default: true
 
 concurrency:
   group: build-and-release
@@ -219,8 +224,17 @@ jobs:
           if [ -z "$PV" ]; then PV="${{ steps.next_ver_code.outputs.NEXT_VER_CODE }}"; fi
           echo "VER=$PV" >> "$GITHUB_OUTPUT"
 
+      - name: Upload build as workflow artifact (no release)
+        if: steps.check.outputs.SHOULD_BUILD == '1' && github.event_name == 'workflow_dispatch' && !inputs.release
+        uses: actions/upload-artifact@v4
+        with:
+          name: morphe-build-${{ steps.next_ver_code.outputs.NEXT_VER_CODE }}
+          path: build/*
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Upload release
-        if: steps.check.outputs.SHOULD_BUILD == '1'
+        if: steps.check.outputs.SHOULD_BUILD == '1' && (github.event_name != 'workflow_dispatch' || inputs.release)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.next_ver_code.outputs.NEXT_VER_CODE }}
@@ -231,7 +245,7 @@ jobs:
           gh release create "$TAG" ./build/* --title "$VER ($TAG)" --notes "$BODY"
 
       - name: Update modules changelog and update json
-        if: steps.check.outputs.SHOULD_BUILD == '1'
+        if: steps.check.outputs.SHOULD_BUILD == '1' && (github.event_name != 'workflow_dispatch' || inputs.release)
         id: update_config
         run: |
           git checkout -f update || git switch --discard-changes --orphan update
@@ -266,7 +280,7 @@ jobs:
           find . -name "*-update.json" | grep . || : >dummy-update.json
 
       - name: Commit module json changes
-        if: steps.check.outputs.SHOULD_BUILD == '1'
+        if: steps.check.outputs.SHOULD_BUILD == '1' && (github.event_name != 'workflow_dispatch' || inputs.release)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -288,7 +302,7 @@ jobs:
           gh run list -L400 --json databaseId -q '.[].databaseId' | tail -n+10 | xargs -P8 -IID gh api "repos/$GITHUB_REPOSITORY/actions/runs/ID" -X DELETE || :
 
       - name: Report to Telegram
-        if: steps.check.outputs.SHOULD_BUILD == '1' && env.TG_TOKEN != null
+        if: steps.check.outputs.SHOULD_BUILD == '1' && (github.event_name != 'workflow_dispatch' || inputs.release) && env.TG_TOKEN != null
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
         run: |
