@@ -444,12 +444,54 @@ def download_file(scraper, direct_url: str, referer: str, out_path: str):
 def parse_size_bytes(soup):
     """File size (bytes) shown on a variant / download page, or None."""
     text = soup.get_text(" ", strip=True)
-    m = re.search(r"File size:\s*[\d.,]+\s*[KMG]B\s*\(([\d,]+)\s*bytes\)", text, re.I)
+    m = re.search(r"([\d,]{5,})\s*bytes", text, re.I)
     if m:
         return int(m.group(1).replace(",", ""))
-    m = re.search(r"File size:\s*([\d.,]+)\s*([KMG])B", text, re.I)
+    m = re.search(r"(?:file\s*size|size)\s*:?\s*([\d.,]+)\s*([KMG])i?B", text, re.I)
     if m:
         return int(float(m.group(1).replace(",", "")) * 1024 ** ("KMG".index(m.group(2).upper()) + 1))
+    return None
+
+def resolve_variant(scraper, v, version_url):
+    """Walk variant page -> download page -> direct link. Fills dl_page, direct, size."""
+    r_variant = safe_get(scraper, v["url"], referer=version_url)
+    if not r_variant or r_variant.status_code != 200:
+        raise Exception(f"variant page returned {getattr(r_variant, 'status_code', None)}")
+    soup_var = BeautifulSoup(r_variant.content, "html.parser")
+    v["size"] = parse_size_bytes(soup_var)
+    dl_btn = soup_var.find("a", {"class": re.compile(r"downloadButton")})
+    if not dl_btn or not dl_btn.get("href"):
+        raise Exception("download button not found")
+    href = dl_btn["href"].strip()
+    v["dl_page"] = "https://www.apkmirror.com" + href if href.startswith("/") else href
+
+    r_dl = safe_get(scraper, v["dl_page"], referer=v["url"])
+    if not r_dl or r_dl.status_code != 200:
+        raise Exception(f"download page returned {getattr(r_dl, 'status_code', None)}")
+    soup_dl = BeautifulSoup(r_dl.content, "html.parser")
+    if v["size"] is None:
+        v["size"] = parse_size_bytes(soup_dl)
+    link = (soup_dl.find("a", href=re.compile(r"download\.php"))
+            or soup_dl.find("a", {"rel": "nofollow", "href": re.compile(r"download\.php|/wp-content/")})
+            or soup_dl.find("a", string=re.compile(r"here", re.I))
+            or soup_dl.find("a", {"rel": "nofollow"}))
+    if not link or not link.get("href"):
+        raise Exception("direct link not found")
+    href = link["href"].strip()
+    v["direct"] = "https://www.apkmirror.com" + href if href.startswith("/") else href
+
+def probe_content_length(scraper, v):
+    """Last resort: ask the file server for the size without downloading the body."""
+    try:
+        r = scraper.get(v["direct"], stream=True, headers={"Referer": v["dl_page"]})
+        try:
+            if r.status_code == 200:
+                cl = r.headers.get("content-length")
+                return int(cl) if cl and cl.isdigit() else None
+        finally:
+            r.close()
+    except Exception:
+        pass
     return None
 
 def download_apkmirror(base_url: str, version: str, output: str, arch: str = "all", dpi: str = ""):
@@ -533,91 +575,58 @@ def download_apkmirror(base_url: str, version: str, output: str, arch: str = "al
     if not raw_variants:
         raise Exception(f"No variants found for {version}")
     
-    # ---- variant selection: compatible with the target arch, then SMALLEST size ----
+    # ---- variant selection: target arch only (e.g. arm64-v8a), SMALLEST size wins ----
     target_arch = arch.lower() if arch else "all"
     v_parts = version.split('.')
     sub_ver = v_parts[-1] if len(v_parts) > 3 else ""
     dpi_l = (dpi or "").lower()
 
-    def compatible(v):
-        if target_arch in ("all", "both"):
-            return True
-        return target_arch in v["arch"] or "universal" in v["arch"] or "noarch" in v["arch"]
-
-    pool = [v for v in raw_variants if compatible(v)] or raw_variants
-    if sub_ver:  # exact build requested (e.g. 4-part version): keep only that build if present
-        exact = [v for v in pool if sub_ver in v["url"]]
-        pool = exact or pool
+    if target_arch in ("all", "both"):
+        pool = list(raw_variants)
+    else:
+        pool = [v for v in raw_variants if target_arch in v["arch"]]
+        if not pool:  # no exact-arch build at all: accept universal ones
+            pool = [v for v in raw_variants if "universal" in v["arch"] or "noarch" in v["arch"]]
+        pool = pool or list(raw_variants)
+    if sub_ver:  # exact build requested (4-part version)
+        pool = [v for v in pool if sub_ver in v["url"]] or pool
     if dpi_l and dpi_l != "nodpi":
         pool = [v for v in pool if dpi_l in v["dpi"]] or pool
 
-    # Variant pages are fetched once here (and served from the page cache later)
-    for v in pool:
-        v["size"] = None
-        if len(pool) > 1:
-            rv = safe_get(scraper, v["url"], referer=version_url)
-            if rv and rv.status_code == 200:
-                v["size"] = parse_size_bytes(BeautifulSoup(rv.content, "html.parser"))
-        print(f"  candidate: arch={v['arch']} bundle={v['is_bundle']} "
-              f"size={v['size'] if v['size'] is not None else '?'} {v['url']}", file=sys.stderr)
-
-    # smallest first; unknown size last; on ties prefer plain APK over bundle, then exact arch
-    ordered_variants = sorted(pool, key=lambda v: (
-        v["size"] is None, v["size"] or 0, v["is_bundle"], target_arch not in v["arch"]))
-    # anything filtered out stays as a last-resort fallback
-    ordered_variants += [v for v in raw_variants if v not in ordered_variants]
-
     last_err = None
-    for idx, selected in enumerate(ordered_variants):
-        print(f"Trying variant {idx+1}/{len(ordered_variants)} (bundle={selected['is_bundle']}, arch={selected['arch']}): {selected['url']}", file=sys.stderr)
+    for v in pool:  # resolve links + sizes (pages are cached, so this is cheap)
+        v["size"], v["failed"] = None, False
         try:
-            r_variant = safe_get(scraper, selected["url"], referer=version_url)
-            if not r_variant or r_variant.status_code != 200:
-                print(f"  Variant page returned {getattr(r_variant, 'status_code', None)}, skipping", file=sys.stderr)
-                continue
-            
-            soup_var = BeautifulSoup(r_variant.content, "html.parser")
-            dl_btn = soup_var.find("a", {"class": re.compile(r"downloadButton")})
-            if not dl_btn or not dl_btn.get("href"):
-                print("  Download button not found, skipping", file=sys.stderr)
-                continue
-            
-            dl_page_href = dl_btn["href"].strip()
-            dl_page_url = "https://www.apkmirror.com" + dl_page_href if dl_page_href.startswith("/") else dl_page_href
-            
-            r_dl = safe_get(scraper, dl_page_url, referer=selected["url"])
-            if not r_dl or r_dl.status_code != 200:
-                print(f"  Download page returned {getattr(r_dl, 'status_code', None)}, skipping", file=sys.stderr)
-                continue
-            
-            soup_dl = BeautifulSoup(r_dl.content, "html.parser")
-            direct_link = soup_dl.find("a", href=re.compile(r"download\.php"))
-            if not direct_link:
-                direct_link = soup_dl.find("a", {"rel": "nofollow", "href": re.compile(r"download\.php|/wp-content/")})
-            if not direct_link:
-                direct_link = soup_dl.find("a", string=re.compile(r"here", re.I))
-            if not direct_link:
-                direct_link = soup_dl.find("a", {"rel": "nofollow"})
-            if not direct_link or not direct_link.get("href"):
-                print("  Direct link not found on download page, skipping", file=sys.stderr)
-                continue
-            
-            direct_href = direct_link["href"].strip()
-            direct_url = "https://www.apkmirror.com" + direct_href if direct_href.startswith("/") else direct_href
-            
+            resolve_variant(scraper, v, version_url)
+            if v["size"] is None and len(pool) > 1:
+                v["size"] = probe_content_length(scraper, v)
+        except Exception as e:
+            v["failed"], last_err = True, e
+        print(f"  candidate: arch={v['arch']} bundle={v['is_bundle']} "
+              f"size={v['size'] if v['size'] is not None else '?'}"
+              f"{' (unresolvable: ' + str(last_err) + ')' if v['failed'] else ''} {v['url']}", file=sys.stderr)
+
+    ok = [v for v in pool if not v["failed"]]
+    # smallest first (apk or apkm, no preference); unknown sizes last
+    ok.sort(key=lambda v: (v["size"] is None, v["size"] or 0))
+    if len(ok) > 1 and ok[0]["size"] is None:
+        print("  WARNING: could not determine any variant size, using page order", file=sys.stderr)
+
+    for idx, selected in enumerate(ok):
+        size_txt = f"{selected['size'] / 1048576:.1f} MiB" if selected["size"] else "unknown size"
+        print(f"Selected variant {idx+1}/{len(ok)} ({size_txt}, bundle={selected['is_bundle']}, "
+              f"arch={selected['arch']}): {selected['url']}", file=sys.stderr)
+        try:
             actual_output = output
-            if selected["is_bundle"]:
-                if not actual_output.endswith(".apkm"):
-                    actual_output = f"{output}.apkm"
-            
-            download_file(scraper, direct_url, dl_page_url, actual_output)
+            if selected["is_bundle"] and not actual_output.endswith(".apkm"):
+                actual_output = f"{output}.apkm"
+            download_file(scraper, selected["direct"], selected["dl_page"], actual_output)
             print(actual_output)
             return actual_output
         except Exception as e:
             last_err = e
-            print(f"  Variant attempt encountered error: {e}", file=sys.stderr)
-            continue
-            
+            print(f"  Download failed: {e}", file=sys.stderr)
+
     raise Exception(f"All variants failed for {version}. Last error: {last_err}")
 
 if __name__ == "__main__":
