@@ -1,2 +1,2 @@
-patches=v2.1.0
+patches=v2.2.0
 cli=v2.1.1
